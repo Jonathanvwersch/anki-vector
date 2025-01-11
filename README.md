@@ -82,7 +82,7 @@ python anki_vector_tool.py add-cards-from-file
 ```
 or
 ```bash
-python anki_vector_tool.py add-cards-from-file example.txt
+python anki_vector_tool.py add-cards-from-file ./decks-to-upload/cards.txt
 ```
 or
 ```bash

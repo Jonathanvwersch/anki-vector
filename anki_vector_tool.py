@@ -268,9 +268,7 @@ def sync_cards(deck_name: str = None):
 
 @cli.command()
 @click.argument("deck_name", required=False)
-@click.option("--front", prompt="Front of card", help="Front content of the card")
-@click.option("--back", prompt="Back of card", help="Back content of the card")
-def add_card(deck_name: str = None, front: str = None, back: str = None):
+def add_card(deck_name: str = None):
     """Add a new card to a deck with similarity checking."""
     tool = AnkiVectorTool()
 
@@ -294,6 +292,30 @@ def add_card(deck_name: str = None, front: str = None, back: str = None):
                 click.echo("Invalid choice. Please try again.")
             except click.Abort:
                 return
+
+    click.echo("\nEnter the front of the card (press Ctrl+D or Ctrl+Z when done):")
+    front_lines = []
+    while True:
+        try:
+            line = input()
+            front_lines.append(line)
+        except EOFError:
+            break
+    front = "\n".join(front_lines)
+
+    click.echo("\nEnter the back of the card (press Ctrl+D or Ctrl+Z when done):")
+    back_lines = []
+    while True:
+        try:
+            line = input()
+            back_lines.append(line)
+        except EOFError:
+            break
+    back = "\n".join(back_lines)
+
+    click.secho("\n🔄 Syncing deck before operation...", fg="yellow", bold=True)
+    tool.add_cards_to_vector_db(deck_name)
+    click.secho("✅ Initial sync complete\n", fg="green")
 
     # Check for similar cards
     similar_cards = tool.find_similar_cards(front, back)
@@ -323,7 +345,6 @@ def add_card(deck_name: str = None, front: str = None, back: str = None):
                 # Add as new card
                 if tool.add_card_to_anki(deck_name, front, back):
                     click.echo("Card added to Anki successfully!")
-                    tool.add_cards_to_vector_db(deck_name)
                 else:
                     click.echo("Failed to add card to Anki.")
             elif 1 <= choice <= len(similar_cards):
@@ -348,6 +369,10 @@ def add_card(deck_name: str = None, front: str = None, back: str = None):
         else:
             click.echo("Failed to add card.")
 
+    click.secho("\n🔄 Syncing deck after operation...", fg="yellow", bold=True)
+    tool.add_cards_to_vector_db(deck_name)
+    click.secho("✅ Final sync complete\n", fg="green")
+
 
 @cli.command()
 def list_decks():
@@ -367,7 +392,7 @@ def list_decks():
 @click.argument("file_path", type=click.Path(exists=True), required=False)
 @click.argument("deck_name", required=False)
 def add_cards_from_file(file_path: str = None, deck_name: str = None):
-    """Add multiple cards from a text file (format: front|||back)."""
+    """Add multiple cards from a text file. Questions should end with '?' and be followed by their answers."""
     tool = AnkiVectorTool()
 
     if file_path is None:
@@ -397,80 +422,69 @@ def add_cards_from_file(file_path: str = None, deck_name: str = None):
                 return
 
     with open(file_path, "r", encoding="utf-8") as f:
-        content = f.read()
-        # Replace literal \n with actual newlines
-        content = content.replace("\\n", "\n")
-        # Split on double newlines to separate QA pairs
-        qa_pairs = content.strip().split("\n\n")
-        cards = []
-        for pair in qa_pairs:
-            parts = pair.split("\n", 1)
-            if len(parts) == 2:
-                cards.append((parts[0], parts[1]))
+        content = f.read().strip()
 
-    for i, card in enumerate(cards, 1):
-        if len(card) != 2:
-            click.echo(f"\nSkipping invalid card format at line {i}")
+    # Split content into lines
+    lines = content.split("\n")
+    cards = []
+    current_question = None
+    current_answer_lines = []
+
+    for line in lines:
+        stripped_line = line.strip()
+        if not stripped_line:  # Skip empty lines
             continue
 
-        front, back = card
-        click.echo(f"\nProcessing card {i}/{len(cards)}:")
-        click.echo(f"Front: {front}")
-        click.echo(f"Back: {back}")
-
-        similar_cards = tool.find_similar_cards(front, back)
-
-        if similar_cards:
-            click.echo("\nSimilar cards found:")
-            for idx, similar in enumerate(similar_cards, 1):
-                click.echo(f"\n{idx}. Similarity: {similar['similarity']:.2%}")
-                click.echo(f"   Front: {similar['front']}")
-                click.echo(f"   Back: {similar['back']}")
-
-            click.echo("\nOptions:")
-            click.echo("0. Add as new card")
-            for i in range(1, len(similar_cards) + 1):
-                click.echo(f"{i}. Replace card #{i} shown above")
-            click.echo("S. Skip this card")
-            click.echo("Q. Quit processing")
-
-            choice = click.prompt("Choose action", type=str).upper()
-
-            if choice == "Q":
-                click.echo("Stopping card processing.")
-                break
-            if choice == "S":
-                click.echo("Skipping this card.")
-                continue
-            if choice.isdigit():
-                choice = int(choice)
-                if choice == 0:
-                    if tool.add_card_to_anki(deck_name, front, back):
-                        click.echo("Card added successfully!")
-                    else:
-                        click.echo("Failed to add card.")
-                elif 1 <= choice <= len(similar_cards):
-                    note_id = similar_cards[choice - 1]["note_id"]
-                    response = tool.invoke_anki_connect(
-                        "updateNoteFields",
-                        {
-                            "note": {
-                                "id": note_id,
-                                "fields": {"Front": front, "Back": back},
-                            }
-                        },
-                    )
-                    if "error" not in response or response["error"] is None:
-                        click.echo("Card updated successfully!")
-                        tool.add_single_card_to_vector_db(note_id)
-                    else:
-                        click.echo("Failed to update card.")
+        # If line ends with ? and isn't indented, it's a new question
+        if stripped_line.endswith("?") and not line.startswith(" "):
+            # Save the previous card if we have one
+            if current_question is not None:
+                cards.append(
+                    (current_question, "\n".join(current_answer_lines).strip())
+                )
+            # Start a new card
+            current_question = stripped_line
+            current_answer_lines = []
         else:
-            # No similar cards found, add automatically
+            # Add to current answer if we have a question
+            if current_question is not None:
+                current_answer_lines.append(line)
+
+    # Don't forget to add the last card
+    if current_question is not None and current_answer_lines:
+        cards.append((current_question, "\n".join(current_answer_lines).strip()))
+
+    click.echo(f"\nFound {len(cards)} cards in file.")
+    click.secho("\n🔄 Syncing deck before processing...", fg="yellow", bold=True)
+    tool.add_cards_to_vector_db(deck_name)
+    click.secho("✅ Initial sync complete\n", fg="green")
+
+    added_count = 0
+    skipped_count = 0
+    with click.progressbar(cards, label="Processing cards") as card_list:
+        for front, back in card_list:
+            # Check for similar cards
+            similar_cards = tool.find_similar_cards(front, back)
+
+            if similar_cards:
+                # If very similar (>90%), skip
+                if any(card["similarity"] > 0.9 for card in similar_cards):
+                    skipped_count += 1
+                    continue
+
+            # Add as new card
             if tool.add_card_to_anki(deck_name, front, back):
-                click.echo("Card added successfully!")
+                added_count += 1
             else:
-                click.echo("Failed to add card.")
+                skipped_count += 1
+
+    click.secho("\n🔄 Syncing deck after processing...", fg="yellow", bold=True)
+    tool.add_cards_to_vector_db(deck_name)
+    click.secho("✅ Final sync complete\n", fg="green")
+
+    click.echo(f"\nProcessing complete:")
+    click.echo(f"- Added: {added_count} cards")
+    click.echo(f"- Skipped: {skipped_count} cards (due to duplicates or errors)")
 
 
 if __name__ == "__main__":
