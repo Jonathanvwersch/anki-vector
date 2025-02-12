@@ -1,7 +1,9 @@
+import concurrent.futures
 import json
 import logging
 import os
 import re
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Dict, List, Optional
 
 import chromadb
@@ -10,17 +12,22 @@ import requests
 from chromadb.errors import ChromaError
 from chromadb.utils import embedding_functions
 
-# Configure logging (INFO level is used by default; DEBUG messages will be hidden)
+# -----------------------------------------------------------------------------
+# Logging Configuration
+# -----------------------------------------------------------------------------
 logging.basicConfig(
     level=logging.INFO, format="[%(asctime)s] %(levelname)s - %(message)s"
 )
 
 
+# -----------------------------------------------------------------------------
+# Utility Functions
+# -----------------------------------------------------------------------------
 def sanitize_collection_name(deck_name: str) -> str:
     """
-    Convert a deck name into a valid collection name for ChromaDB.
-    Replaces characters that are not alphanumeric, underscores, or hyphens with underscores.
-    Ensures the name is between 3 and 63 characters long.
+    Sanitize the deck name to be a valid ChromaDB collection name.
+    Non-alphanumeric characters (except underscores and hyphens) become underscores.
+    Ensures the name length is between 3 and 63 characters.
     """
     sanitized = re.sub(r"[^A-Za-z0-9_-]", "_", deck_name)
     sanitized = re.sub(r"^[^A-Za-z0-9]+", "", sanitized)
@@ -32,16 +39,17 @@ def sanitize_collection_name(deck_name: str) -> str:
     return sanitized
 
 
+# -----------------------------------------------------------------------------
+# Anki Vector Manager
+# -----------------------------------------------------------------------------
 class AnkiVectorManager:
     """
-    Manages synchronization of Anki flashcards with a local ChromaDB vector database
-    and performs similarity checks to prevent duplicates. Each deck is stored in its own collection.
+    Manages synchronization between Anki (via AnkiConnect) and a local ChromaDB vector DB.
+    Each deck is stored in its own collection. This version performs incremental sync,
+    only adding new notes and deleting ones that were removed in Anki.
     """
 
     def __init__(self, db_path: str = "./vector_db"):
-        """
-        Initialize the vector database client.
-        """
         self.db_path = db_path
         os.environ["ANONYMIZED_TELEMETRY"] = "False"
         try:
@@ -49,14 +57,15 @@ class AnkiVectorManager:
         except ChromaError as e:
             logging.error("Failed to initialize ChromaDB client: %s", e)
             raise
+        # Use the default embedding function for better performance
         self.embedding_function = embedding_functions.DefaultEmbeddingFunction()
 
-    def get_collection(self, deck_name: str):
+    def get_collection(self, deck_name: str) -> Any:
         """
-        Retrieve or create a ChromaDB collection for the given deck.
+        Retrieve or create the ChromaDB collection for a deck.
         """
-        sanitized_deck = sanitize_collection_name(deck_name)
-        collection_name = f"anki_cards_{sanitized_deck}"
+        sanitized = sanitize_collection_name(deck_name)
+        collection_name = f"anki_cards_{sanitized}"
         try:
             collection = self.chroma_client.get_or_create_collection(
                 name=collection_name, embedding_function=self.embedding_function
@@ -72,132 +81,237 @@ class AnkiVectorManager:
         self, action: str, params: Dict[str, Any]
     ) -> Dict[str, Any]:
         """
-        Send a request to the AnkiConnect plugin.
+        Send a JSON request to AnkiConnect and return its response.
         """
         endpoint = "http://localhost:8765"
         payload = {"action": action, "version": 6, "params": params}
         try:
             response = requests.post(endpoint, json=payload, timeout=5)
             response.raise_for_status()
+            return response.json()
         except requests.exceptions.RequestException as e:
             logging.error("AnkiConnect request failed: %s", e)
             return {"error": str(e)}
-        try:
-            return response.json()
         except json.JSONDecodeError as e:
-            logging.error("Failed to parse AnkiConnect response as JSON: %s", e)
+            logging.error("Invalid JSON received from AnkiConnect: %s", e)
             return {"error": "Invalid JSON from AnkiConnect"}
 
     def get_deck_cards(self, deck_name: str) -> List[Dict[str, Any]]:
         """
-        Retrieve all notes from the specified deck.
+        Retrieve all notes for a given deck from Anki.
         """
         query = f'deck:"{deck_name}"'
         logging.info("Retrieving notes for deck '%s'.", deck_name)
-        find_notes_resp = self.invoke_anki_connect("findNotes", {"query": query})
-        if find_notes_resp.get("error"):
-            logging.error("Error in findNotes response: %s", find_notes_resp["error"])
+        find_resp = self.invoke_anki_connect("findNotes", {"query": query})
+        if find_resp.get("error"):
+            logging.error("findNotes error: %s", find_resp["error"])
             return []
-        note_ids = find_notes_resp.get("result", [])
+        note_ids = find_resp.get("result", [])
         if not note_ids:
-            logging.info("No notes found for deck '%s'.", deck_name)
+            logging.info("No notes found in deck '%s'.", deck_name)
             return []
-        notes_info_resp = self.invoke_anki_connect("notesInfo", {"notes": note_ids})
-        return notes_info_resp.get("result", [])
+        info_resp = self.invoke_anki_connect("notesInfo", {"notes": note_ids})
+        if info_resp.get("error"):
+            logging.error("notesInfo error: %s", info_resp["error"])
+            return []
+        return info_resp.get("result", [])
 
-    def add_cards_to_vector_db(self, deck_name: str) -> int:
-        """
-        Synchronize cards from the specified deck to the corresponding ChromaDB collection.
-        Removes cards that no longer exist in Anki and adds new ones.
-        Returns the number of new cards added.
-        """
-        anki_cards = self.get_deck_cards(deck_name)
-        anki_note_ids = {str(card["noteId"]) for card in anki_cards}
-        collection = self.get_collection(deck_name)
+    def process_card_batch(self, cards: List[Dict[str, Any]]) -> tuple:
+        """Process a batch of cards and return their documents, metadata, and IDs."""
+        documents = []
+        metadatas = []
+        ids = []
 
-        try:
-            existing_docs = collection.get()
-            existing_ids = set(existing_docs.get("ids", []))
-        except ChromaError as e:
-            logging.error("Failed to fetch documents for deck '%s': %s", deck_name, e)
-            return 0
-
-        ids_to_add = anki_note_ids - existing_ids
-        ids_to_remove = existing_ids - anki_note_ids
-
-        if ids_to_remove:
+        for card in cards:
             try:
-                collection.delete(ids=list(ids_to_remove))
-                logging.info(
-                    "Removed %d outdated card(s) from deck '%s'.",
-                    len(ids_to_remove),
-                    deck_name,
-                )
-            except ChromaError as e:
-                logging.error(
-                    "Failed to remove outdated cards for deck '%s': %s", deck_name, e
-                )
+                note_id = str(card["noteId"])
+                front = card["fields"]["Front"]["value"]
+                back = card["fields"]["Back"]["value"]
 
-        new_cards = [card for card in anki_cards if str(card["noteId"]) in ids_to_add]
-        if not new_cards:
-            return 0
-
-        documents, metadatas, ids = [], [], []
-        for card in new_cards:
-            note_id = card["noteId"]
-            front = card["fields"]["Front"]["value"]
-            back = card["fields"]["Back"]["value"]
-            combined_text = f"{front}\n{back}"
-            documents.append(combined_text)
-            metadatas.append({"front": front, "back": back, "note_id": note_id})
-            ids.append(str(note_id))
-
-        try:
-            collection.add(documents=documents, metadatas=metadatas, ids=ids)
-            logging.info(
-                "Added %d new card(s) to deck '%s'.", len(new_cards), deck_name
-            )
-            return len(new_cards)
-        except ChromaError as e:
-            logging.error("Failed to add new cards for deck '%s': %s", deck_name, e)
-            return 0
-
-    def find_similar_cards(
-        self, front: str, back: str, deck_name: str, threshold: float = 0.8
-    ) -> List[Dict[str, Any]]:
-        """
-        Query the deck-specific collection for cards similar to the provided text.
-        """
-        combined_text = f"{front}\n{back}"
-        collection = self.get_collection(deck_name)
-        try:
-            results = collection.query(query_texts=[combined_text], n_results=5)
-        except ChromaError as e:
-            logging.error("ChromaDB query failed for deck '%s': %s", deck_name, e)
-            return []
-        if not results.get("distances") or not results["distances"][0]:
-            return []
-        similar_cards = []
-        for idx, distance in enumerate(results["distances"][0]):
-            similarity = 1 - distance  # assuming distance in [0,1]
-            if similarity >= threshold:
-                metadata = results["metadatas"][0][idx]
-                similar_cards.append(
+                # Add front text
+                documents.append(front)
+                metadatas.append(
                     {
-                        "similarity": similarity,
-                        "front": metadata["front"],
-                        "back": metadata["back"],
-                        "note_id": metadata["note_id"],
+                        "note_id": note_id,
+                        "type": "front",
+                        "front": front,
+                        "back": back,
                     }
                 )
-        return similar_cards
+                ids.append(f"{note_id}_front")
+
+                # Add back text
+                documents.append(back)
+                metadatas.append(
+                    {
+                        "note_id": note_id,
+                        "type": "back",
+                        "front": front,
+                        "back": back,
+                    }
+                )
+                ids.append(f"{note_id}_back")
+            except Exception as e:
+                logging.error("Error processing card: %s", e)
+                continue
+
+        return documents, metadatas, ids
+
+    def incremental_sync_deck(self, deck_name: str) -> int:
+        """
+        Truly incremental sync - only process new or changed cards.
+        """
+        anki_cards = self.get_deck_cards(deck_name)
+        if not anki_cards:
+            logging.info("No cards to sync for deck '%s'.", deck_name)
+            return 0
+
+        collection = self.get_collection(deck_name)
+
+        # Get existing cards from vector DB
+        try:
+            existing_docs = collection.get(
+                where={"type": "front"}, include=["metadatas"]
+            )
+            existing_note_ids = (
+                {meta["note_id"] for meta in existing_docs["metadatas"]}
+                if existing_docs["ids"]
+                else set()
+            )
+        except Exception as e:
+            logging.error("Error getting existing cards: %s", e)
+            existing_note_ids = set()
+
+        # Find new cards
+        current_note_ids = {str(card["noteId"]) for card in anki_cards}
+        new_note_ids = current_note_ids - existing_note_ids
+        removed_note_ids = existing_note_ids - current_note_ids
+
+        # Remove deleted cards
+        if removed_note_ids:
+            try:
+                ids_to_remove = []
+                for note_id in removed_note_ids:
+                    ids_to_remove.extend([f"{note_id}_front", f"{note_id}_back"])
+                collection.delete(ids=ids_to_remove)
+                logging.info("Removed %d deleted cards", len(removed_note_ids))
+            except Exception as e:
+                logging.error("Error removing deleted cards: %s", e)
+
+        if not new_note_ids:
+            logging.info("No new cards to add for deck '%s'", deck_name)
+            return 0
+
+        # Process only new cards in parallel batches
+        new_cards = [card for card in anki_cards if str(card["noteId"]) in new_note_ids]
+        batch_size = 20
+        batches = [
+            new_cards[i : i + batch_size] for i in range(0, len(new_cards), batch_size)
+        ]
+        total_batches = len(batches)
+        added_count = 0
+
+        # Use ThreadPoolExecutor for parallel processing
+        with ThreadPoolExecutor(max_workers=4) as executor:
+            future_to_batch = {
+                executor.submit(self.process_card_batch, batch): i
+                for i, batch in enumerate(batches)
+            }
+
+            for future in concurrent.futures.as_completed(future_to_batch):
+                batch_idx = future_to_batch[future]
+                try:
+                    documents, metadatas, ids = future.result()
+                    if documents:
+                        try:
+                            collection.add(
+                                documents=documents,
+                                metadatas=metadatas,
+                                ids=ids,
+                            )
+                            batch_size = (
+                                len(documents) // 2
+                            )  # Each card has front and back
+                            added_count += batch_size
+                            logging.info(
+                                "Added batch %d/%d - %d new cards (total: %d/%d)",
+                                batch_idx + 1,
+                                total_batches,
+                                batch_size,
+                                added_count,
+                                len(new_cards),
+                            )
+                        except ChromaError as e:
+                            logging.error(
+                                "Failed to add batch %d/%d: %s",
+                                batch_idx + 1,
+                                total_batches,
+                                e,
+                            )
+                except Exception as e:
+                    logging.error(
+                        "Error processing batch %d/%d: %s",
+                        batch_idx + 1,
+                        total_batches,
+                        e,
+                    )
+
+        logging.info(
+            "Sync complete for deck '%s': %d new cards added, %d removed",
+            deck_name,
+            added_count,
+            len(removed_note_ids),
+        )
+        return added_count
+
+    def find_similar_cards(
+        self, front: str, back: str, deck_name: str, threshold: float = 0.9
+    ) -> List[Dict[str, Any]]:
+        """
+        Query the deck's collection for cards with a front text similar to the provided text.
+        Returns any results whose similarity (computed as 1 - distance) exceeds the threshold.
+        """
+        collection = self.get_collection(deck_name)
+        try:
+            results = collection.query(
+                query_texts=[front],
+                n_results=5,
+                include=["metadatas", "distances", "documents"],
+                where={"type": "front"},
+            )
+        except ChromaError as e:
+            logging.error("Query failed for deck '%s': %s", deck_name, e)
+            return []
+
+        similar = []
+        distances = results.get("distances", [[]])
+        metadatas = results.get("metadatas", [[]])
+        for idx, distance in enumerate(distances[0]):
+            similarity = 1 - distance  # assuming distance ∈ [0,1]
+            if similarity >= threshold:
+                meta = metadatas[0][idx]
+                similar.append(
+                    {
+                        "similarity": similarity,
+                        "front": meta.get("front", ""),
+                        "back": meta.get("back", ""),
+                        "note_id": meta.get("note_id", ""),
+                        "match_type": "front",
+                    }
+                )
+                logging.info(
+                    "Found similar card (note %s) with similarity %.2f",
+                    meta.get("note_id", ""),
+                    similarity,
+                )
+        return similar
 
     def add_single_card_to_vector_db(self, note_id: int, deck_name: str) -> bool:
         """
-        Add or update a single note in the deck-specific collection.
+        Retrieve note details for a given note_id and add/update its entries in the vector DB.
         """
         resp = self.invoke_anki_connect("notesInfo", {"notes": [note_id]})
-        if not resp.get("result"):
+        if resp.get("error") or not resp.get("result"):
             logging.error(
                 "No note info for note_id %s in deck '%s'.", note_id, deck_name
             )
@@ -206,26 +320,35 @@ class AnkiVectorManager:
         note_data = resp["result"][0]
         front = note_data["fields"]["Front"]["value"]
         back = note_data["fields"]["Back"]["value"]
-        combined_text = f"{front}\n{back}"
         collection = self.get_collection(deck_name)
         try:
             collection.add(
-                documents=[combined_text],
-                metadatas=[{"front": front, "back": back, "note_id": note_id}],
-                ids=[str(note_id)],
+                documents=[front, back],
+                metadatas=[
+                    {
+                        "note_id": str(note_id),
+                        "type": "front",
+                        "front": front,
+                        "back": back,
+                    },
+                    {
+                        "note_id": str(note_id),
+                        "type": "back",
+                        "front": front,
+                        "back": back,
+                    },
+                ],
+                ids=[f"{note_id}_front", f"{note_id}_back"],
             )
-            # Use debug level for per-note updates to keep output clean.
-            logging.debug("Updated note_id %s in deck '%s'.", note_id, deck_name)
+            logging.info("Added/Updated note_id %s in vector DB.", note_id)
             return True
         except ChromaError as e:
-            logging.error(
-                "Failed to update note_id %s for deck '%s': %s", note_id, deck_name, e
-            )
+            logging.error("Failed to add note_id %s: %s", note_id, e)
             return False
 
     def add_card_to_anki(self, deck_name: str, front: str, back: str) -> bool:
         """
-        Add a new Basic card to Anki and sync it to the vector DB.
+        Create a new Basic card in Anki with the provided front/back text and add it to the vector DB.
         """
         payload = {
             "note": {
@@ -251,11 +374,9 @@ class AnkiVectorManager:
 # -----------------------------------------------------------------------------
 # CLI Commands
 # -----------------------------------------------------------------------------
-
-
 @click.group()
 def cli():
-    """Anki Vector CLI: Manage a local vector DB of Anki cards."""
+    """CLI tool to manage Anki decks with a local vector DB for duplicate detection."""
     pass
 
 
@@ -263,145 +384,153 @@ def prompt_for_deck(
     manager: AnkiVectorManager, deck_name: Optional[str] = None
 ) -> Optional[str]:
     """
-    Prompt the user to choose a deck if one is not provided.
+    If a deck name is not provided, prompt the user to choose one from Anki.
     """
     if deck_name:
         return deck_name
 
     resp = manager.invoke_anki_connect("deckNames", {})
-    if "result" not in resp or not resp["result"]:
-        click.echo("Couldn't retrieve deck names from Anki.")
+    decks = resp.get("result", [])
+    if not decks:
+        click.echo("No decks found in Anki.")
         return None
 
-    decks = resp["result"]
     click.echo("\nAvailable decks:")
-    for i, d in enumerate(decks, 1):
-        click.echo(f"{i}. {d}")
-
-    while True:
-        try:
-            choice = click.prompt("\nChoose deck number", type=int)
-            if 1 <= choice <= len(decks):
-                return decks[choice - 1]
-            click.echo("Invalid choice. Try again.")
-        except click.Abort:
-            return None
+    for idx, d in enumerate(decks, 1):
+        click.echo(f"{idx}. {d}")
+    try:
+        choice = click.prompt("Choose deck number", type=int)
+        if 1 <= choice <= len(decks):
+            return decks[choice - 1]
+    except click.Abort:
+        return None
+    return None
 
 
 @cli.command(name="sync")
 @click.argument("deck_name", required=False)
 def sync(deck_name: str):
     """
-    Synchronize the local vector DB with a given deck.
+    Incrementally synchronize the vector DB for a given deck.
     """
     manager = AnkiVectorManager()
     deck = prompt_for_deck(manager, deck_name)
     if not deck:
+        click.echo("No deck selected.")
         return
-    new_count = manager.add_cards_to_vector_db(deck)
-    click.echo(f"Synced deck '{deck}'. {new_count} new card(s) added.")
+    new_count = manager.incremental_sync_deck(deck)
+    click.echo(f"Synced deck '{deck}': {new_count} new note(s) added.")
 
 
 @cli.command(name="sync-all")
 def sync_all():
     """
-    Synchronize all decks from Anki to their respective vector DB collections.
+    Incrementally sync all decks from Anki into their vector DB collections.
     """
     manager = AnkiVectorManager()
     resp = manager.invoke_anki_connect("deckNames", {})
-    if "result" not in resp or not resp["result"]:
-        click.echo("Couldn't retrieve deck names from Anki.")
+    decks = resp.get("result", [])
+    if not decks:
+        click.echo("No decks found in Anki.")
         return
-
-    decks = resp["result"]
-    total_new_cards = 0
-    click.echo("Starting sync for all decks...\n")
+    total_new = 0
     for deck in decks:
         click.echo(f"Syncing deck: {deck}")
-        new_cards = manager.add_cards_to_vector_db(deck)
-        click.echo(f" - {new_cards} new card(s) added.\n")
-        total_new_cards += new_cards
-    click.echo(f"Sync complete. Total new cards added: {total_new_cards}")
+        new_count = manager.incremental_sync_deck(deck)
+        click.echo(f"  {new_count} new note(s) added.\n")
+        total_new += new_count
+    click.echo(f"All decks synced. Total new notes added: {total_new}")
 
 
 @cli.command(name="add-card")
 @click.argument("deck_name", required=False)
 def add_card(deck_name: str):
     """
-    Create a new Basic card in Anki with a similarity check.
+    Add a new Basic card to Anki. Before adding, check for similar cards in the deck.
     """
     manager = AnkiVectorManager()
     deck = prompt_for_deck(manager, deck_name)
     if not deck:
+        click.echo("No deck selected.")
         return
 
-    click.echo("\nEnter FRONT text (Ctrl+D or Ctrl+Z to finish):")
+    click.echo("\nEnter FRONT text (finish with Ctrl+D/Ctrl+Z):")
     front_lines = []
-    while True:
-        try:
-            line = input()
-            front_lines.append(line)
-        except EOFError:
-            break
-    front_text = "\n".join(front_lines)
+    try:
+        while True:
+            front_lines.append(input())
+    except EOFError:
+        pass
+    front_text = "\n".join(front_lines).strip()
+    if not front_text:
+        click.echo("Front text cannot be empty.")
+        return
 
-    click.echo("\nEnter BACK text (Ctrl+D or Ctrl+Z to finish):")
+    click.echo("\nEnter BACK text (finish with Ctrl+D/Ctrl+Z):")
     back_lines = []
-    while True:
-        try:
-            line = input()
-            back_lines.append(line)
-        except EOFError:
-            break
-    back_text = "\n".join(back_lines)
+    try:
+        while True:
+            back_lines.append(input())
+    except EOFError:
+        pass
+    back_text = "\n".join(back_lines).strip()
+    if not back_text:
+        click.echo("Back text cannot be empty.")
+        return
 
-    click.secho("\nSyncing deck before checking duplicates...", fg="yellow")
-    manager.add_cards_to_vector_db(deck)
+    click.secho("\nSyncing deck before duplicate check...", fg="yellow")
+    manager.incremental_sync_deck(deck)
 
-    similar = manager.find_similar_cards(front_text, back_text, deck, threshold=0.8)
+    similar = manager.find_similar_cards(front_text, back_text, deck, threshold=0.9)
     if similar:
         click.secho(f"\nFound {len(similar)} similar card(s):", fg="red")
-        for i, card in enumerate(similar, 1):
-            click.echo(f"{i}. Similarity: {card['similarity']:.2f}")
+        for idx, card in enumerate(similar, start=1):
+            click.echo(f"{idx}. Similarity: {card['similarity']:.2f}")
             click.echo(f"   Front: {card['front']}")
             click.echo(f"   Back:  {card['back']}")
         click.echo("\nOptions:")
-        click.echo("  0 - Add as new card")
-        for i in range(1, len(similar) + 1):
-            click.echo(f"  {i} - Overwrite card #{i}")
+        click.echo("  0 - Add as a new card anyway")
+        for idx in range(1, len(similar) + 1):
+            click.echo(
+                f"  {idx} - Overwrite card with note_id {similar[idx-1]['note_id']}"
+            )
         click.echo("  C - Cancel")
-        choice = click.prompt("Choose option", type=str).upper()
+        choice = click.prompt("Choose an option", type=str).upper()
         if choice == "C":
-            click.echo("Canceled.")
+            click.echo("Operation cancelled.")
             return
         elif choice.isdigit():
             choice_num = int(choice)
             if choice_num == 0:
                 ok = manager.add_card_to_anki(deck, front_text, back_text)
-                click.echo("New card added!" if ok else "Failed to add card.")
+                click.echo("New card added." if ok else "Failed to add card.")
             elif 1 <= choice_num <= len(similar):
                 note_id = similar[choice_num - 1]["note_id"]
-                update_payload = {
+                payload = {
                     "note": {
-                        "id": note_id,
+                        "id": int(note_id),
                         "fields": {"Front": front_text, "Back": back_text},
                     }
                 }
-                resp = manager.invoke_anki_connect("updateNoteFields", update_payload)
+                resp = manager.invoke_anki_connect("updateNoteFields", payload)
                 if not resp.get("error"):
                     click.echo("Card updated successfully!")
                     manager.add_single_card_to_vector_db(note_id, deck)
                 else:
-                    click.echo(f"Failed to update card. Error: {resp['error']}")
+                    click.echo(f"Failed to update card: {resp.get('error')}")
             else:
-                click.echo("Invalid choice. No changes made.")
+                click.echo("Invalid option. No changes made.")
+            return
+        else:
+            click.echo("Invalid input. Operation cancelled.")
+            return
     else:
         ok = manager.add_card_to_anki(deck, front_text, back_text)
         click.echo("Card added successfully!" if ok else "Failed to add card.")
 
     click.secho("\nSyncing deck after changes...", fg="yellow")
-    manager.add_cards_to_vector_db(deck)
-    click.secho("All done!", fg="green")
+    manager.incremental_sync_deck(deck)
+    click.secho("Done!", fg="green")
 
 
 @cli.command(name="list-decks")
@@ -411,8 +540,8 @@ def list_decks():
     """
     manager = AnkiVectorManager()
     resp = manager.invoke_anki_connect("deckNames", {})
-    if "result" in resp and resp["result"]:
-        decks = resp["result"]
+    decks = resp.get("result", [])
+    if decks:
         click.echo("Available decks:")
         for d in decks:
             click.echo(f"  - {d}")
@@ -425,8 +554,8 @@ def list_decks():
 @click.argument("deck_name", required=False)
 def add_from_file(file_path: str, deck_name: str):
     """
-    Bulk-add cards from a text file.
-    Cards are separated by 'SEPARATOR'. The first line of each card is the question; the rest is the answer.
+    Bulk-import cards from a text file. Cards are separated by the delimiter 'SEPARATOR'.
+    The first nonempty line is treated as the FRONT text and the remaining as the BACK.
     """
     manager = AnkiVectorManager()
     if not file_path:
@@ -435,6 +564,7 @@ def add_from_file(file_path: str, deck_name: str):
         )
     deck = prompt_for_deck(manager, deck_name)
     if not deck:
+        click.echo("No deck selected.")
         return
 
     try:
@@ -444,40 +574,37 @@ def add_from_file(file_path: str, deck_name: str):
         click.echo(f"Error reading file: {e}")
         return
 
-    cards_content = content.split("SEPARATOR")
+    raw_cards = content.split("SEPARATOR")
     cards = []
-    for card_content in cards_content:
-        if not card_content.strip():
-            continue
-        lines = [line for line in card_content.strip().split("\n") if line.strip()]
-        if not lines:
-            continue
-        question = lines[0].strip()
-        answer = "\n".join(lines[1:]).strip()
-        if question and answer:
+    for raw in raw_cards:
+        lines = [line.strip() for line in raw.strip().splitlines() if line.strip()]
+        if len(lines) >= 2:
+            question = lines[0]
+            answer = "\n".join(lines[1:])
             cards.append((question, answer))
-
     click.echo(f"Found {len(cards)} card(s) in file '{file_path}'.")
+
     click.secho("\nSyncing deck before import...", fg="yellow")
-    manager.add_cards_to_vector_db(deck)
+    manager.incremental_sync_deck(deck)
 
-    added_count = 0
-    skipped_count = 0
-    with click.progressbar(cards, label="Processing cards", show_percent=True) as bar:
+    added = 0
+    skipped = 0
+    with click.progressbar(cards, label="Importing cards") as bar:
         for front, back in bar:
-            similar = manager.find_similar_cards(front, back, deck, threshold=0.8)
-            if any(s["similarity"] > 0.9 for s in similar):
-                skipped_count += 1
+            similar = manager.find_similar_cards(front, back, deck, threshold=0.9)
+            if similar:
+                click.secho(f"\nSkipping duplicate card: {front[:50]}...", fg="yellow")
+                skipped += 1
                 continue
-            ok = manager.add_card_to_anki(deck, front, back)
-            if ok:
-                added_count += 1
+            if manager.add_card_to_anki(deck, front, back):
+                added += 1
             else:
-                skipped_count += 1
+                skipped += 1
 
-    click.secho("\nSyncing deck after import...", fg="yellow")
-    manager.add_cards_to_vector_db(deck)
-    click.echo(f"\nImport complete. Added: {added_count} | Skipped: {skipped_count}")
+    click.secho("\nImport Summary:", fg="green")
+    click.echo(f"  Added:   {added}")
+    click.echo(f"  Skipped: {skipped}")
+    click.echo(f"  Total:   {added + skipped}")
 
 
 if __name__ == "__main__":

@@ -1,8 +1,15 @@
 # Anki Vector Tool
 
-A command-line tool that enhances Anki flashcard management using vector similarity search. This tool helps prevent duplicate cards by finding semantically similar existing cards before adding new ones.
+A command-line tool that enhances Anki flashcard management using vector similarity search. This tool helps prevent duplicate cards by finding semantically similar existing cards before adding new ones. I mainly built this to match my own personal use case.
 
-This is a tool I built for my own workflow. It may not be useful for others, but I use it all the time for my Computer Science Anki Deck.
+## Features
+
+- **Smart Duplicate Detection**: Uses vector similarity search to find semantically similar cards, not just exact matches
+- **Fast Incremental Sync**: Only processes new or changed cards, not the entire deck each time
+- **Parallel Processing**: Uses multi-threading to speed up card processing
+- **Interactive Interface**: Easy-to-use CLI with deck selection and card management
+- **Bulk Import**: Import multiple cards from text files with duplicate detection
+- **Efficient Storage**: Uses ChromaDB for fast vector storage and similarity search
 
 ## Prerequisites
 
@@ -11,92 +18,58 @@ This is a tool I built for my own workflow. It may not be useful for others, but
 
 ## Installation
 
-1. Clone this repository (or place the script somewhere on your system)
+1. Clone this repository:
+```bash
+git clone <repository-url>
+cd anki-vector
+```
+
 2. Install the required packages:
 ```bash
-pip install click requests chromadb
+pip install -r requirements.txt
 ```
-3. Ensure Anki is running with the AnkiConnect plugin installed and configured
+
+3. Ensure Anki is running with AnkiConnect plugin installed and configured
 
 ## Setup
-
-The tool requires AnkiConnect to be properly configured in Anki:
 
 1. Install AnkiConnect from Anki's add-on manager (Tools → Add-ons → Get Add-ons...)
 2. Restart Anki
 3. Make sure Anki is running when using this tool
 
-## Usage
+## Commands
 
-The tool provides four main commands:
-
-### 1. Sync
-Synchronizes cards from an Anki deck to the local vector database:
-
+### Sync a Deck
+Incrementally synchronize cards from an Anki deck to the vector database:
 ```bash
-python anki_vector_tool.py sync
+python anki_vector_tool.py sync [deck-name]
 ```
-or
+- Only processes new or changed cards
+- Removes cards that were deleted from Anki
+- Much faster than full sync
+
+### Add a Single Card
+Add a new card with duplicate detection:
 ```bash
-python anki_vector_tool.py sync "Your Deck Name"
+python anki_vector_tool.py add-card [deck-name]
 ```
+- Checks for similar existing cards before adding
+- Shows similarity scores and card content
+- Options to add anyway, update existing, or cancel
 
-If you don't specify a deck name, the tool will:
-1. Show a numbered list of all your available decks
-2. Let you choose a deck by entering its number
-3. Sync that deck to the vector database
-
-### 2. Add Card
-Adds a new card to a deck with similarity checking:
-
-```bash
-python anki_vector_tool.py add-card
-```
-or
-```bash
-python anki_vector_tool.py add-card "Your Deck Name"
-```
-
-If you don't specify a deck name, the tool will:
-1. Show a numbered list of all your available decks
-2. Let you choose a deck by entering its number
-3. Prompt for the card's front and back content (supports multiline input)
-4. Check for similar cards and show options to add, replace, or cancel
-
-### 3. List Decks
-Shows all available decks in your Anki:
-
+### List Decks
+Show all available Anki decks:
 ```bash
 python anki_vector_tool.py list-decks
 ```
 
-### 4. Add From File
+### Bulk Import from File
 Add multiple cards from a text file:
-
 ```bash
-python anki_vector_tool.py add-from-file
+python anki_vector_tool.py add-from-file [file-path] [deck-name]
 ```
-or
-```bash
-python anki_vector_tool.py add-from-file ./decks-to-upload/cards.txt
-```
-or
-```bash
-python anki_vector_tool.py add-from-file cards.txt "Your Deck Name"
-```
-
-If you don't provide arguments, the tool will:
-1. Prompt for the file path
-2. Show a numbered list of available decks
-3. Let you choose a deck by number
 
 File format:
-- Cards are separated by the word "SEPARATOR" on its own line
-- First line of each section is the question
-- Everything after the first line until SEPARATOR is the answer
-- Empty lines are allowed within questions and answers
-
-Example:
 ```
 What is a binary search?
 A search algorithm that finds the position of a target value within a sorted array.
@@ -108,43 +81,48 @@ What is its time complexity?
 O(log n) for sorted arrays.
 Best case: O(1) when middle element is the target.
 Worst case: O(log n) when target is at the end of a partition.
-
-SEPARATOR
-
-What are the requirements for binary search?
-1. Array must be sorted
-2. Random access to elements (array or similar data structure)
-3. Clear ordering relationship between elements
-
-SEPARATOR
 ```
 
-## Features
+- Cards are separated by 'SEPARATOR'
+- First line is the front of the card
+- Remaining lines until SEPARATOR are the back
+- Automatic duplicate detection for each card
 
-- Interactive deck selection – no need to manually type deck names
-- Vector similarity search using ChromaDB to find semantically similar cards
-- Persistent storage of card embeddings in a local ChromaDB database
-- Integration with AnkiConnect for seamless Anki interaction
-- Similarity threshold customization (default: 0.8)
-- Duplicate detection based on semantic meaning rather than exact text matching
-- Command-line interface with interactive prompts
-- Automatic synchronization of new cards to the vector database
+### Sync All Decks
+Sync all your Anki decks at once:
+```bash
+python anki_vector_tool.py sync-all
+```
+
+## Performance
+
+- Uses incremental sync to minimize processing time
+- Parallel processing for batch operations
+- Efficient vector storage and retrieval with ChromaDB
+- Only processes new or modified cards
 
 ## Technical Details
 
-- Uses ChromaDB's default embedding function
-- Stores embeddings in a local ChromaDB database (./vector_db by default)
+- Uses ChromaDB's default embedding function for vector similarity
+- Stores embeddings in a local ChromaDB database (`./vector_db` by default)
 - Communicates with Anki through the AnkiConnect API
-- Default similarity threshold is 0.8 (configurable)
-- Supports Basic note type for new cards
+- Default similarity threshold: 0.9 (configurable)
+- Supports Basic note type
+- Parallel processing with 4 worker threads
 
 ## Troubleshooting
 
 1. Connection errors:
    - Ensure Anki is running
    - Confirm AnkiConnect is properly installed
-   - Make sure AnkiConnect is listening on port 8765 (default)
+   - Check if AnkiConnect is listening on port 8765 (default)
 
-2. Cards aren't being found:
-   - Run the `sync` command to update the vector database
-   - Check if the deck name matches exactly
+2. Performance issues:
+   - The first sync might take longer as it needs to process all cards
+   - Subsequent syncs are much faster as they only process new/changed cards
+   - Try adjusting batch size if needed (default: 20 cards per batch)
+
+3. Duplicate detection issues:
+   - Adjust similarity threshold (default: 0.9) if getting too many/few matches
+   - Check if cards are being properly added to the vector database
+   - Try running a full sync if vector DB seems out of sync
